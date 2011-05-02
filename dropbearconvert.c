@@ -112,9 +112,29 @@ static int do_convert(int intype, const char* infile, int outtype,
 
 	sign_key * key = NULL;
 	char * keytype = NULL;
+	char * password = NULL;
 	int ret = 1;
+	char prompt[] = "please input passphrase:";
 
-	key = import_read(infile, NULL, intype);
+  if(import_encrypted(infile, intype)) {
+#ifdef ENABLE_CLI_ASKPASS_HELPER
+    if (want_askpass())
+    {
+      password = gui_getpass(prompt);
+      if (!password) {
+        dropbear_exit("No passphrase");
+      }
+    } else
+#endif
+    {
+      password = getpass(prompt);
+    }
+    if(!password) {
+      dropbear_close("Invalid passphrase");
+    }
+  }
+
+	key = import_read(infile, password, intype);
 	if (!key) {
 		fprintf(stderr, "Error reading key from '%s'\n",
 				infile);
@@ -134,7 +154,7 @@ static int do_convert(int intype, const char* infile, int outtype,
 
 	fprintf(stderr, "Key is a %s key\n", keytype);
 
-	if (import_write(outfile, key, NULL, outtype) != 1) {
+	if (import_write(outfile, key, password, outtype) != 1) {
 		fprintf(stderr, "Error writing key to '%s'\n", outfile);
 	} else {
 		fprintf(stderr, "Wrote key to '%s'\n", outfile);
@@ -142,6 +162,7 @@ static int do_convert(int intype, const char* infile, int outtype,
 	}
 
 out:
+	m_burn(password, strlen(password));
 	if (key) {
 		sign_key_free(key);
 	}

@@ -32,6 +32,7 @@
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include <tomcrypt.h>
 #include "keyimport.h"
 #include "bignum.h"
 #include "buffer.h"
@@ -506,6 +507,30 @@ static int openssh_encrypted(const char *filename)
 	return ret;
 }
 
+static void prepare_des3_key(unsigned char *iv, char *passphrase, unsigned char * keybuf) {
+	/*
+	 * Derive encryption key from passphrase and iv/salt:
+	 *
+	 *  - let block A equal MD5(passphrase || iv)
+	 *  - let block B equal MD5(A || passphrase || iv)
+	 *  - block C would be MD5(B || passphrase || iv) and so on
+	 *  - encryption key is the first N bytes of A || B
+	 */
+		hash_state md5c;
+
+		md5_init(&md5c);
+		md5_process(&md5c, (unsigned char *)passphrase, strlen(passphrase));
+		md5_process(&md5c, iv, 8);
+		md5_done(&md5c, keybuf);
+
+		md5_init(&md5c);
+		md5_process(&md5c, keybuf, 16);
+		md5_process(&md5c, (unsigned char *)passphrase, strlen(passphrase));
+		md5_process(&md5c, iv, 8);
+		md5_done(&md5c, keybuf+16);
+		m_burn(&md5c, sizeof(md5c));
+}
+
 static sign_key *openssh_read(const char *filename, char *passphrase)
 {
 	struct openssh_key *key;
@@ -521,47 +546,32 @@ static sign_key *openssh_read(const char *filename, char *passphrase)
 	sign_key *retkey;
 	buffer * blobbuf = NULL;
 
+	int des3_id = register_cipher(&des3_desc );
 	key = load_openssh_key(filename);
 
 	if (!key)
 		return NULL;
 
 	if (key->encrypted) {
-		errmsg = "encrypted keys not supported currently";
-		goto error;
-#if 0
-		/* matt TODO */
-		/*
-		 * Derive encryption key from passphrase and iv/salt:
-		 * 
-		 *  - let block A equal MD5(passphrase || iv)
-		 *  - let block B equal MD5(A || passphrase || iv)
-		 *  - block C would be MD5(B || passphrase || iv) and so on
-		 *  - encryption key is the first N bytes of A || B
-		 */
-		struct MD5Context md5c;
 		unsigned char keybuf[32];
+		symmetric_CBC cbc_state;
+		int suc = 0;
 
-		MD5Init(&md5c);
-		MD5Update(&md5c, (unsigned char *)passphrase, strlen(passphrase));
-		MD5Update(&md5c, (unsigned char *)key->iv, 8);
-		MD5Final(keybuf, &md5c);
-
-		MD5Init(&md5c);
-		MD5Update(&md5c, keybuf, 16);
-		MD5Update(&md5c, (unsigned char *)passphrase, strlen(passphrase));
-		MD5Update(&md5c, (unsigned char *)key->iv, 8);
-		MD5Final(keybuf+16, &md5c);
-
+		prepare_des3_key((unsigned char*)key->iv, passphrase, keybuf);
 		/*
 		 * Now decrypt the key blob.
+		 * use libtomcrypt instead of putty one
 		 */
-		des3_decrypt_pubkey_ossh(keybuf, (unsigned char *)key->iv,
-								 key->keyblob, key->keyblob_len);
+		suc = (CRYPT_OK == cbc_start(des3_id /* des3 */, (unsigned char *)key->iv, keybuf, 24, 0, &cbc_state))
+			&& (CRYPT_OK == cbc_decrypt(key->keyblob, key->keyblob, key->keyblob_len, &cbc_state))
+			&& (CRYPT_OK == cbc_done(&cbc_state));
 
-		memset(&md5c, 0, sizeof(md5c));
-		memset(keybuf, 0, sizeof(keybuf));
-#endif 
+		m_burn(keybuf, sizeof(keybuf));
+		m_burn(&cbc_state, sizeof(symmetric_CBC));
+
+		if(!suc) {
+			dropbear_exit("invalid private key or passphrase!");
+		}
 	}
 
 	/*
@@ -581,7 +591,7 @@ static sign_key *openssh_read(const char *filename, char *passphrase)
 	 *  - For DSA, we expect them to be 0, p, q, g, y, x in that
 	 *	order.
 	 */
-	
+
 	p = key->keyblob;
 
 	/* Expect the SEQUENCE header. Take its absence as a failure to decrypt. */
@@ -611,10 +621,10 @@ static sign_key *openssh_read(const char *filename, char *passphrase)
 
 	for (i = 0; i < num_integers; i++) {
 		ret = ber_read_id_len(p, key->keyblob+key->keyblob_len-p,
-							  &id, &len, &flags);
+				&id, &len, &flags);
 		p += ret;
 		if (ret < 0 || id != 2 ||
-			key->keyblob+key->keyblob_len-p < len) {
+				key->keyblob+key->keyblob_len-p < len) {
 			errmsg = "ASN.1 decoding failure";
 			goto error;
 		}
@@ -675,7 +685,7 @@ static sign_key *openssh_read(const char *filename, char *passphrase)
 	errmsg = NULL;					 /* no error */
 	retval = retkey;
 
-	error:
+error:
 	if (blobbuf) {
 		buf_burn(blobbuf);
 		buf_free(blobbuf);
@@ -1344,7 +1354,7 @@ sign_key *sshcom_read(const char *filename, char *passphrase)
 		 *  - block C would be MD5(passphrase || A || B) and so on
 		 *  - encryption key is the first N bytes of A || B
 		 */
-		struct MD5Context md5c;
+		hash_state md5c;
 		unsigned char keybuf[32], iv[8];
 
 		if (cipherlen % 8 != 0) {
@@ -1353,14 +1363,14 @@ sign_key *sshcom_read(const char *filename, char *passphrase)
 			goto error;
 		}
 
-		MD5Init(&md5c);
-		MD5Update(&md5c, (unsigned char *)passphrase, strlen(passphrase));
-		MD5Final(keybuf, &md5c);
+		md5_init(&md5c);
+		md5_process(&md5c, (unsigned char *)passphrase, strlen(passphrase));
+		md5_done(keybuf, &md5c);
 
-		MD5Init(&md5c);
-		MD5Update(&md5c, (unsigned char *)passphrase, strlen(passphrase));
-		MD5Update(&md5c, keybuf, 16);
-		MD5Final(keybuf+16, &md5c);
+		md5_init(&md5c);
+		md5_process(&md5c, (unsigned char *)passphrase, strlen(passphrase));
+		md5_process(&md5c, keybuf, 16);
+		md5_done(keybuf+16, &md5c);
 
 		/*
 		 * Now decrypt the key blob.
@@ -1621,17 +1631,17 @@ int sshcom_write(const char *filename, sign_key *key,
 		 *  - block C would be MD5(passphrase || A || B) and so on
 		 *  - encryption key is the first N bytes of A || B
 		 */
-		struct MD5Context md5c;
+		hash_state md5c;
 		unsigned char keybuf[32], iv[8];
 
-		MD5Init(&md5c);
-		MD5Update(&md5c, (unsigned char *)passphrase, strlen(passphrase));
-		MD5Final(keybuf, &md5c);
+		md5_init(&md5c);
+		md5_process(&md5c, (unsigned char *)passphrase, strlen(passphrase));
+		md5_done(keybuf, &md5c);
 
-		MD5Init(&md5c);
-		MD5Update(&md5c, (unsigned char *)passphrase, strlen(passphrase));
-		MD5Update(&md5c, keybuf, 16);
-		MD5Final(keybuf+16, &md5c);
+		md5_init(&md5c);
+		md5_process(&md5c, (unsigned char *)passphrase, strlen(passphrase));
+		md5_process(&md5c, keybuf, 16);
+		md5_done(keybuf+16, &md5c);
 
 		/*
 		 * Now decrypt the key blob.
